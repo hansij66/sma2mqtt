@@ -25,5 +25,8 @@ Tested under Linux; there is no reason why it does not work under Windows.
 GPL v3
 
 ## Versions
+1.1.2:
+* Fix exit code (SUCCESS vs FAILURE)
+
 1.1.0:
 * Initial version on github

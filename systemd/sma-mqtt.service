@@ -18,10 +18,9 @@ Environment="PYTHONPATH=/opt/python/lib"
 Restart=on-failure
 RestartSec=60s
 
-#Type=oneshot
-Type=simple
+Type=idle
 ExecStart=/opt/iot/sma/sma-mqtt.py
-RemainAfterExit=true
+#RemainAfterExit=true
 
 [Install]
 WantedBy=network-online.target

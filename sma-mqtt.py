@@ -26,7 +26,7 @@
         along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 __author__ = "Hans IJntema"
 __license__ = "GPLv3"
 
@@ -46,6 +46,9 @@ import mqtt as mqtt
 from log import logger
 logger.setLevel(cfg.loglevel)
 
+# DEFAULT exit code
+# status=1/FAILURE
+__exit_code = 1
 
 # ------------------------------------------------------------------------------------
 # Instance running?
@@ -67,17 +70,16 @@ if sys.platform == "linux":
     sys.exit(1)
 
 
-def close(exit_code):
+def close():
   """
   Args:
-    :param int exit_code: 0 success; 1 error
 
   Returns:
     None
   """
 
-  logger.info(f"Exitcode = {exit_code} >>")
-  sys.exit(exit_code)
+  logger.info(f"Exitcode = {__exit_code} >>")
+  sys.exit(__exit_code)
 
 
 # ------------------------------------------------------------------------------------
@@ -120,6 +122,10 @@ def exit_gracefully(sig, stackframe):
   """
 
   logger.debug(f"Signal {sig}: >>")
+
+  # status=0/SUCCESS
+  __exit_code = 0
+
   threads_stopper.set()
   logger.info("<<")
 
@@ -169,4 +175,4 @@ if __name__ == '__main__':
   main()
 
   logger.debug("__main__: <<")
-  close(0)
+  close()
