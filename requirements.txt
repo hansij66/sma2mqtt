@@ -1,5 +1,7 @@
 paho-mqtt
-pymodbus
+pymodbus>=3.8.0,<4.0.0
+pymodbustcp~=0.3.0
 
-# Debian: sudo apt-get install python3-paho-mqtt
-# sudo pip3 install paho-mqtt --user
+html-table-parser-python3>0.3.0
+
+tenacity>9.0.0

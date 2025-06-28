@@ -68,6 +68,59 @@ logger = logging.getLogger(script + "." + __name__)
 
 
 class MQTTClient(threading.Thread):
+  """
+  Manages an MQTT client as a separate thread, allowing asynchronous MQTT operations.
+
+  This class extends `threading.Thread` and provides an implementation for managing
+  an MQTT client for publish and subscribe functionalities. It supports configurable
+  parameters such as broker, port, QoS, protocol versions, client ID, clean session flag,
+  username-password authentication, and more. It includes functionality to handle
+  reconnections, manage various events (connect, disconnect, subscribe, unsubscribe, etc.),
+  and maintain thread-safe communication with the broker.
+
+  :ivar __mqtt_broker: The hostname or IP address of the MQTT broker
+  :type __mqtt_broker: str
+  :ivar __mqtt_stopper: A `threading.Event` to signal stopping the MQTT thread
+  :type __mqtt_stopper: threading.Event
+  :ivar __mqtt_port: The port to connect to the MQTT broker
+  :type __mqtt_port: int
+  :ivar __mqtt_client_id: Unique client ID for identifying this MQTT client
+  :type __mqtt_client_id: str
+  :ivar __qos: The QoS level for MQTT messages (0, 1, or 2)
+  :type __qos: int
+  :ivar __mqtt_cleansession: Determines whether to start a clean session at broker
+  :type __mqtt_cleansession: bool
+  :ivar __mqtt_protocol: The MQTT protocol version to use
+  :type __mqtt_protocol: int
+  :ivar __worker_threads_stopper: A `threading.Event` to signal stopping related worker threads
+  :type __worker_threads_stopper: threading.Event
+  :ivar __mqtt: The underlying `paho-mqtt` client instance
+  :type __mqtt: paho.mqtt.client.Client
+  :ivar __run: Indicates whether the MQTT thread is running
+  :type __run: bool
+  :ivar __keepalive: Maximum period in seconds to wait for messages from the broker
+  :type __keepalive: int
+  :ivar __MQTT_CONNECTION_TIMEOUT: Maximum time in seconds to wait for reconnection
+  :type __MQTT_CONNECTION_TIMEOUT: int
+  :ivar __connected_flag: Indicates the current connection status to the broker
+  :type __connected_flag: bool
+  :ivar __disconnect_start_time: Timestamp of the last disconnect event
+  :type __disconnect_start_time: int
+  :ivar __mqtt_counter: Counter for the total number of MQTT messages published
+  :type __mqtt_counter: int
+  :ivar __status_topic: Topic used to publish client status messages
+  :type __status_topic: str
+  :ivar __status_payload: Payload for the client status messages
+  :type __status_payload: str
+  :ivar __status_retain: Retain flag for status topic messages
+  :type __status_retain: bool
+  :ivar __message_trigger: Event triggered when a message is received and stored in the queue
+  :type __message_trigger: threading.Event
+  :ivar __subscribed_queue: Queue for storing received subscribed messages
+  :type __subscribed_queue: queue.Queue
+  :ivar __list_of_subscribed_topics: List of topics this client is subscribed to
+  :type __list_of_subscribed_topics: list
+  """
   def __init__(self,
                mqtt_broker,
                mqtt_stopper,
@@ -115,6 +168,10 @@ class MQTTClient(threading.Thread):
       self.__mqtt_client_id = mqtt_client_id
 
     logger.info(f"MQTT Client ID = {self.__mqtt_client_id}")
+
+    if mqtt_qos not in [0, 1, 2]:
+      logger.error(f"Invalid QoS level = {mqtt_qos}; reset to qos=1")
+      mqtt_qos = 1
 
     self.__qos = mqtt_qos
     self.__mqtt_cleansession = mqtt_cleansession
@@ -197,6 +254,10 @@ class MQTTClient(threading.Thread):
     self.__status_payload = None
     self.__status_retain = None
 
+    # Maintain last return code MQTT publish
+    # Can be used to print update message if successful after error
+    self.__last_rc = 0
+
     #######
     # Trigger to clients/threads to indicate that message is received and stored in queue
     self.__message_trigger = None
@@ -208,32 +269,62 @@ class MQTTClient(threading.Thread):
     self.__list_of_subscribed_topics = []
 
   def __del__(self):
+    """
+    Destructor to clean up when the instance of the object is being destroyed.
+
+    This method logs the shutdown of the MQTT client and provides information about
+    the number of MQTT messages that have been published during the lifecycle of the
+    object. It is automatically invoked when the object's reference count reaches zero.
+
+    :return: None
+    """
     logger.debug(f">>")
     logger.info(f"Shutting down MQTT Client... {self.__mqtt_counter} MQTT messages have been published")
 
   def __internet_on(self):
     """
-      Test if there is connectivity with the MQTT broker
+    Checks internet connectivity to the MQTT broker.
 
-    Returns:
-      return: connectivity status (True, False)
-      rtype: bool
+    This method attempts to establish a socket connection to the MQTT broker using
+    the provided broker address and port. It is used to determine if the device
+    has functional internet connectivity to communicate with the specified MQTT
+    broker. If the connection is successful, the socket is shut down and closed,
+    and the method returns True. If any exception occurs during the connection
+    process, it logs the exception details and returns False.
+
+    :return: True if internet connectivity to the MQTT broker is available,
+        otherwise False.
+    :rtype: bool
     """
     logger.debug(f">>")
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
       # Format: s.connect((HOST, PORT))
-      s.connect((f"{self.__mqtt_broker}", int(self.__mqtt_port)))
-      s.shutdown(socket.SHUT_RDWR)
+      socket_connection.connect((f"{self.__mqtt_broker}", int(self.__mqtt_port)))
+      socket_connection.shutdown(socket.SHUT_RDWR)
       logger.debug(f"Internet connectivity to MQTT broker {self.__mqtt_broker} at port {self.__mqtt_port} available")
       return True
     except Exception as e:
       logger.info(f"Internet connectivity to MQTT broker {self.__mqtt_broker} at port {self.__mqtt_port} "
                   f"NOT yet available; Exception {e}")
       return False
+    finally:
+      socket_connection.close()
 
   def __set_connected_flag(self, flag=True):
+    """
+    Sets the connected flag and handles the disconnect timing logic.
+
+    This method updates the internal state of the connected flag and triggers a
+    disconnect timer in case the connected flag is transitioning from True to False.
+
+    :param flag: A boolean value that represents the desired state of the connected
+                 flag. Defaults to True.
+    :type flag: bool
+
+    :return: None
+    """
     logger.debug(f">> flag={flag}; current __connected_flag={self.__connected_flag}")
 
     # if flag == False and __connected_flag == True; start trigger
@@ -246,18 +337,21 @@ class MQTTClient(threading.Thread):
 
   def __on_connect(self, _client, userdata, flags, rc, _properties=None):
     """
-    Callback: when the client receives a CONNACK response from the broker.
+    Handles the MQTT client's connection event and performs actions based on the connection
+    status. This method is triggered when the MQTT client successfully connects to or fails
+    to connect with the broker.
 
-    Args:
-      :param ? _client: the client instance for this callback
-      :param ? userdata: the private user data as set in Client()
-      :param dict flags: response flags sent by the broker
-      :param int rc: the connection result --> connack_dict
-      :param _properties: The MQTT v5.0 properties received from the broker.  A
-              list of Properties class instances.
+    If the connection is successful, it sets the connected flag, updates the status, and re-subscribes
+    to any previously subscribed topics. If the connection fails, it logs the error and sets the
+    connected flag accordingly.
 
-    Returns:
-      None
+    :param _client: The MQTT client instance that triggered the connection event
+    :param userdata: User-defined data provided during client initialization
+    :param flags: A dictionary of response flags sent by the broker
+    :param rc: The result code of the connection, used to determine the success or failure of the connection
+    :param _properties: Optional properties of the connection, typically used for MQTT v5.0
+
+    :return: None
     """
     logger.debug(f">>")
     if rc == mqtt_client.CONNACK_ACCEPTED:
@@ -276,17 +370,19 @@ class MQTTClient(threading.Thread):
 
   def __on_disconnect(self, _client, userdata, rc, _properties=None):
     """
-    Callback: called when the client disconnects from the broker.
+    Handles the MQTT disconnection event and logs the appropriate message based on the
+    disconnect reason (unexpected or expected). Updates the connection flag in the client.
 
-    Args:
-      :param ? _client: the client instance for this callback
-      :param ? userdata: the private user data as set in Client()
-      :param int rc: the disconnection result --> rc_dict
-      :param _properties: The MQTT v5.0 properties received from the broker.  A
-              list of Properties class instances.
-
-    Returns:
-      None
+    :param _client: The MQTT client instance that was disconnected.
+    :type _client: Any
+    :param userdata: The private user data provided when the MQTT client was created.
+    :type userdata: Any
+    :param rc: The disconnect reason code.
+    :type rc: int
+    :param _properties: Optional MQTT properties associated with the disconnection.
+    :type _properties: Optional[Any]
+    :return: None
+    :rtype: None
     """
     if rc != mqtt_client.MQTT_ERR_SUCCESS:
       logger.warning(f"Unexpected disconnect, userdata = {userdata}; rc = {rc}: {mqtt_client.error_string(rc)}")
@@ -298,10 +394,18 @@ class MQTTClient(threading.Thread):
 
   def __on_message(self, _client, _userdata, message):
     """
-    :param _client:
-    :param _userdata:
-    :param message: Queue()
-    :return:
+    Handles the 'on_message' client callback when a message is received.
+
+    This method is triggered when a message is received on a subscribed topic.
+    The received message is placed into the subscribed queue for processing.
+    If a message trigger event is defined, it is set to signal that a message
+    has been received.
+
+    :param _client: The MQTT client instance that received the message.
+    :param _userdata: The private user data passed to the client.
+    :param message: The received message instance, containing topic and payload.
+    :type message: MQTTMessage
+    :return: None
     """
     logger.debug(f">> message = {message.topic}  {message.payload}")
 
@@ -313,29 +417,42 @@ class MQTTClient(threading.Thread):
 
   def __on_publish(self, _client, userdata, mid):
     """
-    Callback: when a message that was to be sent using the publish() call has completed transmission to the broker.
+    Handles the successful publishing of a message.
 
-    Args:
-      :param ? _client: the client instance for this callback
-      :param ? userdata: the private user data as set in Client()
-      :param ? mid: matches the mid-variable returned from the corresponding publish()
+    This method is a callback invoked automatically by the MQTT client library
+    when a message has been successfully published to a topic. It logs the provided
+    userdata and message identifier (mid) for debugging purposes.
 
-    Returns:
-      None
+    :param _client: The MQTT client instance invoking the callback.
+    :param userdata: Application-defined data passed to the callback (can be None).
+    :param mid: Message identifier assigned by the MQTT library.
+    :return: None
     """
     logger.debug(f"userdata={userdata}; mid={mid}")
     return None
 
   def __on_subscribe_v5(self, _client, _userdata, mid, reasoncodes, _properties=None):
     """
-    :param _client: The client instance for this callback
-    :param _userdata: The private user data as set in Client() or userdata_set()
-    :param mid: Matches the mid-variable returned from the corresponding subscribe() call.
-    :param reasoncodes: The MQTT v5.0 reason codes received from the broker for each
-                        subscription.  A list of ReasonCodes instances.
-    :param _properties: The MQTT v5.0 properties received from the broker.  A
-                      list of Properties class instances.
-    :return:
+    Handles the MQTT v5 subscription acknowledgement callback.
+
+    This method is invoked when a subscription request to a topic is acknowledged by
+    the broker. It processes and logs the message identifier and reason codes
+    associated with the subscription. The optional properties parameter provides
+    additional metadata for the subscription when applicable.
+
+    :param _client: The client instance that initiated the subscription.
+    :type _client: Client
+    :param _userdata: Custom user data passed to the callback by the user.
+    :type _userdata: Any
+    :param mid: The message identifier of the subscription request.
+    :type mid: int
+    :param reasoncodes: A list of reason codes returned by the broker to indicate the
+        result of each topic filter subscription.
+    :type reasoncodes: list[int]
+    :param _properties: Optional properties returned by the broker in MQTT v5.
+        May include metadata or additional subscription-related information.
+    :type _properties: dict, optional
+    :return: None
     """
     logger.debug(f"Subscribed mid variable: {mid}")
 
@@ -344,12 +461,16 @@ class MQTTClient(threading.Thread):
 
   def __on_subscribe_v31(self, _client, _userdata, mid, granted_qos):
     """
-    :param _client:
-    :param _userdata:
-    :param mid:
-    :param granted_qos: list of integers that give the QoS level the broker has
-                        granted for each of the different subscription requests.
-    :return:
+    Handles the subscription callback for MQTT protocol version 3.1.
+
+    This method is triggered when the client successfully subscribes to a topic,
+    logging information related to the subscription mid and granted QoS levels.
+
+    :param _client: The MQTT client instance invoking the callback.
+    :param _userdata: The private user data, if set when the client was created.
+    :param mid: The message ID of the subscription request.
+    :param granted_qos: A list containing the QoS levels for each requested subscription.
+    :return: None
     """
     logger.debug(f"Subscribed mid variable: {mid}")
 
@@ -358,34 +479,50 @@ class MQTTClient(threading.Thread):
 
   def __on_unsubscribe(self, _client, _userdata, mid, _properties=None, _reasoncode=None):
     """
-    :param _client:
-    :param _userdata:
-    :param mid:
-    :param _reasoncode:
-    :param _properties: The MQTT v5.0 properties received from the broker.  A
-           list of Properties class instances.
-    :return:
+    Handles the unsubscribe event triggered in an MQTT client.
+
+    This method is a callback function which is automatically invoked when the
+    client successfully unsubscribes from a topic. The corresponding parameters
+    are provided by the MQTT client through this callback. Additionally, this
+    method logs the identifier of the associated unsubscribe action for debugging
+    purposes.
+
+    :param _client: The MQTT client instance associated with the callback.
+    :param _userdata: Any user-defined data passed to the callback function.
+    :param mid: Message identifier for the unsubscribe request.
+    :param _properties: Optional. A dictionary containing MQTT V5 properties,
+        if the MQTT version supports it.
+    :param _reasoncode: Optional. Unsubscribe reason code, if available.
+    :return: None
     """
     logger.debug(f">> Unsubscribed: {mid}")
 
   def __on_log(self, client, _userdata, level, buf):
     """
-    Callback: when the client has log information.
+    Handles logging for the client by capturing messages logged at a specific level.
 
-    Args:
-      :param ? client:
-      :param ? _userdata:
-      :param ? level: severity of the message
-      :param ? buf: message
+    This private method is responsible for logging debug information based on
+    parameters received, including the client object, log level, and buffer content.
 
-    Returns:
-      None
+    :param client: The client object associated with the log message.
+    :param _userdata: User-defined data, generally unspecified or unused in this context.
+    :param level: The logging level indicating the severity of the message.
+    :type level: int
+    :param buf: The actual log message or buffer content.
+    :type buf: str
+    :return: None
     """
     logger.debug(f"obj={client}; level={level}; buf={buf}")
 
   def __set_status(self):
     """
-    Publish MQTT status message
+    Updates the status by publishing the status payload to the specified status topic.
+
+    The method checks if the `__status_topic` attribute is not `None`. If it is set,
+    it publishes the `__status_payload` to the given `__status_topic` with the
+    specified retain flag. The function makes no direct output but calls
+    `do_publish` for the publishing process and utilizes logging for debugging.
+
     :return: None
     """
     logger.debug(">>")
@@ -397,12 +534,22 @@ class MQTTClient(threading.Thread):
 
   def set_status(self, topic, payload=None, retain=False):
     """
-    Set status
-    Will store status & resend on a reconnect
+    Sets the status configuration for the current instance and triggers the
+    status update operation. It defines the topic, payload, and retain
+    flag for publishing the status.
 
-    :param str topic:
-    :param str payload:
-    :param bool retain:
+    The method is used to configure status-related details, which are
+    subsequently handled by the internal __set_status method to manage
+    publishing the status to the specified topic with the given payload
+    and retain flag.
+
+    :param topic: The MQTT topic to which the status will be published.
+    :type topic: str
+    :param payload: The payload to be sent as the status message. Defaults to None.
+    :type payload: Optional[Any]
+    :param retain: Specifies if the message should be retained by the broker.
+                   Defaults to False.
+    :type retain: bool
     :return: None
     """
     logger.debug(">>")
@@ -413,13 +560,21 @@ class MQTTClient(threading.Thread):
 
   def will_set(self, topic, payload=None, qos=1, retain=False):
     """
-    Set last will/testament
-    It is advised to call before self.run() is called
+    Sets the Last Will and Testament (LWT) for the MQTT client instance. The LWT
+    is a message that will be published automatically by the broker if the client
+    disconnects unexpectedly. This method allows users to specify the topic, message
+    payload, Quality of Service level, and retain flag for the LWT.
 
-    :param str topic:
-    :param str payload:
-    :param int qos:
-    :param bool retain:
+    .. note::
+       It is recommended to set the LWT before calling the run() method as per
+       MQTT documentation. Setting the LWT after the client is running may lead
+       to unexpected behavior.
+
+    :param topic: The topic on which the Last Will message will be published.
+    :param payload: The message payload for the Last Will (default is None).
+    :param qos: Quality of Service level for the Last Will message (default is 1).
+    :param retain: Flag to specify if the Last Will message should be retained by the broker
+                   (default is False).
     :return: None
     """
     logger.debug(f">>")
@@ -431,15 +586,23 @@ class MQTTClient(threading.Thread):
 
   def do_publish(self, topic, message, retain=False):
     """
-    Publish topic & message to MQTT broker
+    Publishes a message to a specified MQTT topic.
 
-    Args:publish(topic, payload=None, qos=0, retain=False)
-      :param str topic: MQTT topic
-      :param str message: MQTT message
-      :param bool retain: retained flag MQTT message
+    This method sends a message to the provided MQTT topic with an option to
+    retain the message on the broker. It logs the publishing status and updates
+    a counter upon successful message delivery. If the publishing fails, a
+    warning is logged.
 
-    Returns:
-      None
+    :param topic: The topic to which the message is published.
+    :type topic: str
+    :param message: The payload message to be published to the topic.
+    :type message: str
+    :param retain: Specifies whether to retain the message on the broker. Defaults to False.
+    :type retain: bool
+    :return: MQTT message information object of the publish operation. May
+        include details such as delivery acknowledgment or success status.
+    :rtype: mqtt.MQTTMessageInfo
+    :raises ValueError: Raised if provided message or topic parameters are invalid or unsupported.
     """
     logger.debug(f">> TOPIC={topic}; MESSAGE={message}")
 
@@ -448,20 +611,36 @@ class MQTTClient(threading.Thread):
       self.__mqtt_counter += 1
 
       if mqttmessageinfo.rc != mqtt_client.MQTT_ERR_SUCCESS:
-        logger.warning(f"MQTT publish was not successfull, rc = {mqttmessageinfo.rc}: "
-                       f"{mqtt_client.error_string(mqttmessageinfo.rc)}")
+        logger.warning(f"MQTT publish was not successful, rc = {mqttmessageinfo.rc}:{mqtt_client.error_string(mqttmessageinfo.rc)}")
+        self.__last_rc = mqttmessageinfo.rc
+      else:
+        # Print only successful if previous publish was not successful
+        # To prevent flooding of messages
+        if self.__last_rc != 0:
+          logger.info(f"MQTT publish was successful, rc = {mqttmessageinfo.rc}:{mqtt_client.error_string(mqttmessageinfo.rc)}")
+          self.__last_rc = 0
+
     except ValueError:
       logger.warning("")
 
   def set_message_trigger(self, subscribed_queue, trigger=None):
     """
-    Call before subscribing
-    The received messages are stored in a queue
-    If a message is received, trigger event will be set
+    Sets a trigger for messages and subscribes to the given queue.
 
-    :param subscribed_queue: Queue() - as received by on_message (topic, payload,..)
-    :param trigger: threading.Event(); OPTIONAL: to indicate that message has been received
-    :return:
+    This method assigns a message trigger and queues the subscription to
+    a specified queue. If there are topics stored from a previous state,
+    it attempts to re-subscribe to those topics in case a connection was
+    lost. The subscribed topics utilize the provided Quality of Service (QoS)
+    level to maintain the desired connection reliability.
+
+    :param subscribed_queue: A queue to which the subscription will be applied
+                             for processing incoming messages.
+    :type subscribed_queue: Any
+    :param trigger: A callable or functional trigger for processing incoming
+                    messages. If `None`, no trigger is set.
+    :type trigger: Optional[Callable]
+    :return: None
+    :rtype: None
     """
 
     self.__message_trigger = trigger
@@ -475,6 +654,19 @@ class MQTTClient(threading.Thread):
     return
 
   def subscribe(self, topic):
+    """
+    Subscribes to a given topic and manages the subscription queue.
+
+    This method is responsible for subscribing to the specified MQTT topic.
+    It ensures that the given topic is added to the internal list of subscribed topics
+    for potential resubscription during reconnection. The method will not perform the
+    subscription if the client is not connected or if the subscription message queue
+    has not been properly set.
+
+    :param topic: The MQTT topic to subscribe to.
+    :type topic: str
+    :return: None
+    """
     logger.debug(f">> topic = {topic}")
 
     # Add to subscribed topic to queue (for resubscribing when reconnecting)
@@ -496,12 +688,14 @@ class MQTTClient(threading.Thread):
 
   def unsubscribe(self, topic):
     """
-    Unsubscribe topic
-    Use exactly same topic as with subscribe, otherwise topic will not be removed
-    from buffer used to restore subscriptions during a reconnect
+    Unsubscribes from the given MQTT topic. The method removes the topic
+    from the internal list of subscribed topics and performs the actual
+    unsubscription via the MQTT client. If the topic is not in the list
+    of subscribed topics, a warning is logged.
 
-    :param topic:
-    :return:
+    :param topic: The topic to unsubscribe from.
+    :type topic: str
+    :return: None
     """
     logger.debug(f">> topic = {topic}")
     self.__mqtt.unsubscribe(topic)
@@ -565,7 +759,8 @@ class MQTTClient(threading.Thread):
         self.__mqtt_stopper.set()
 
     except Exception as e:
-      logger.exception(f"Exception {format(e)}")
+      # logger.exception(f"Exception {format(e)}")
+      logger.warning(f"Exception {format(e)}")
       self.__mqtt.disconnect()
       self.__mqtt_stopper.set()
       self.__worker_threads_stopper.set()
@@ -589,7 +784,8 @@ class MQTTClient(threading.Thread):
           try:
             self.__mqtt.reconnect()
           except Exception as e:
-            logger.exception(f"Exception {format(e)}")
+            # logger.exception(f"Exception {format(e)}")
+            logger.warning(f"Exception {format(e)}")
 
             # reconnect failed....reset disconnect time, and retry after self.__MQTT_CONNECTION_TIMEOUT
             self.__disconnect_start_time = int(time.time())

@@ -1,0 +1,103 @@
+* {
+	font-family: SMA Futura Japanese, Arial Unicode MS, Arial;
+	font-size: 11pt;
+}
+body {
+	background: white;
+	padding: 0px;
+	margin: 0px;
+	min-width: 512px;
+}
+footer {
+	color: #000;
+	background: #fafafa;
+}
+nav {
+	background: #212121;
+	color: #ddd;
+	padding: 10px 25px;
+	display: none;
+}
+#header {
+	padding: 25px;
+}
+#header p {
+	padding-top: 4pt;
+}
+#header img {
+	float: right;
+	padding-left: 20px;
+	padding-bottom: 20px;
+}
+#headercontent {
+	margin-right: 99px;
+}
+#legend , #footer {
+	border-top: 1px solid #ececec;
+	padding: 10px 25px;
+}
+#footer p {
+	font-size: 9pt;
+}
+.floatingTable {
+	position: relative;
+}
+.headFloat {
+	position: absolute;
+	top: 0px;
+}
+h1 {
+	font-family: SMA Futura Japanese Light, Arial Unicode MS, Arial;
+	font-weight: normal;
+	font-size: 16pt;
+	margin: 0;
+	padding: 0;
+}
+h2 {
+	margin: 0;
+	padding: 0;
+	font-size: 16pt;
+}
+p {
+	margin: 0;
+	padding: 0;
+}
+table {
+	border-spacing: 0;
+	margin: 0 0 8pt 0;
+}
+td, th {
+	padding: 4pt 8pt 4pt 4pt;
+	vertical-align: top;
+}
+th {
+	background: #ececec;
+	text-align: left;
+	cursor: pointer;
+	border-bottom: 3px solid #ececec;
+	transition-duration: 600ms;
+}
+th:hover {
+	border-bottom: 3px solid #e2001a;
+	transition-duration: 600ms;
+}
+tr:nth-child(odd) {
+	background: #fafafa;
+}
+tr:nth-child(even) {
+	background: white;
+}
+td {
+	border-bottom: 1px solid #999999;
+}
+b {
+	font-weight: bold;
+}
+ul {
+	margin: 0pt;
+	padding: 0pt;
+}
+li {
+	margin: 0 0 0 18pt;
+	padding: 0pt;
+}

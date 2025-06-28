@@ -16,156 +16,194 @@
         along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+from typing import Dict, List, Any
+from dataclasses import dataclass
 import threading
 import copy
 import time
 import json
+import os
 
-from pymodbus.constants import Endian
-from pymodbus.payload import BinaryPayloadDecoder
-
+# ----------------------------------------------------------------------------------------------------------------------
+# Local imports
+# ----------------------------------------------------------------------------------------------------------------------
 import config as cfg
-from modbus_sma_sb5 import sma_definition
-
-# Logging
+import mqtt as mqtt
 import __main__
 import logging
-import os
-script = os.path.basename(__main__.__file__)
-script = os.path.splitext(script)[0]
-logger = logging.getLogger(script + "." + __name__)
+
+logger = logging.getLogger(f"{os.path.splitext(os.path.basename(__main__.__file__))[0]}.{__name__}")
 
 
-class ParseTelegrams(threading.Thread):
+# ----------------------------------------------------------------------------------------------------------------------
+# DataFormat
+# --------------------------------------------------------------------------------------------------------------------
+@dataclass
+class DataFormat:
+  """Configuration for different data formats and their processing rules"""
+
+  # Data format conversion factors
+  # FIX0 has multiplier 1, and is an integer, hence PASSTHROUGH_FORMATS
+  FORMAT_MULTIPLIERS = {
+    #     "FIX0": 1,
+    "FIX1": 0.1,
+    "FIX2": 0.01,
+    "FIX3": 0.001,
+    "FIX4": 0.0001,
+    "TEMP": 0.1
+  }
+
+  # Data formats that should be converted to strings
+  STRING_FORMATS = {"IP4", "RAW", "UTF8"}
+
+  # Data formats that should be kept as-is
+  PASSTHROUGH_FORMATS = {"FIX0", "Duration", "Dauer", "TM", "TAGLIST", "ENUM", "FW", "REV"}
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# class ParseTelegrams
+# --------------------------------------------------------------------------------------------------------------------
+class TelegramParser(threading.Thread):
   """
+  Handles parsing of SMA telegrams, performs data processing, and publishes messages
+  to an MQTT broker. Extends the threading.Thread class to utilize threaded execution.
+
+  The class allows for modular decoding of telegram data, supporting various data formats
+  with conversion or passthrough capabilities. It enables communication with an MQTT broker
+  to publish parsed and structured data in JSON format.
   """
 
-  def __init__(self, trigger, stopper, mqtt, telegram):
+  def __init__(self,
+               trigger: threading.Event,
+               stopper: threading.Event,
+               mqttclient: mqtt.MQTTClient,
+               telegram: List,
+               invertername: str) -> None:
     """
+    Initialize the telegram parser.
+
     Args:
-      :param threading.Event() trigger: signals that new telegram is available
-      :param threading.Event() stopper: stops thread
-      :param mqtt.mqttclient() mqtt: reference to mqtt worker
-      :param list() telegram: sma telegram
+        trigger: Event signaling that new telegram is available
+        stopper: Event to stop the thread
+        mqttclient: Reference to MQTT worker
+        telegram: SMA telegram data
+        invertername: Name of the inverter
     """
-    logger.debug(">>")
+
+    logger.debug(f"{invertername}: >>")
     super().__init__()
     self.__trigger = trigger
     self.__stopper = stopper
     self.__telegram = telegram
-    self.__mqtt = mqtt
+    self.__mqtt = mqttclient
+    self.__invertername = invertername
+    self.__dataformat = DataFormat()
 
-  def __del__(self):
-    logger.debug(">>")
+    logger.debug(f"{self.__invertername}: <<")
+    return
 
-  def __publish_telegram(self, json_dict):
-    # publish the dictionaries per topic
+  def __del__(self) -> None:
+    logger.debug(f"{self.__invertername}: >>")
+    logger.debug(f"{self.__invertername}: <<")
+    return
+
+  def __publish_mqtt_message(self,
+                             payload: Dict[str, Any]) -> None:
+    """
+    Publish telegram data as MQTT message.
+
+    Args:
+      payload: JSON Dictionary of key:value pairs to publish as MQTT message.
+    """
+    logger.debug(f"{self.__invertername}: >>")
 
     # make resilient against double forward slashes in topic
-    topic = cfg.MQTT_TOPIC_PREFIX
-    topic = topic.replace('//', '/')
-    message = json.dumps(json_dict, sort_keys=True, separators=(',', ':'))
-    self.__mqtt.do_publish(topic, message, retain=False)
+    topic = f"{cfg.MQTT_TOPIC_PREFIX}/{self.__invertername}".replace('//', '/')
+    message = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    self.__mqtt.do_publish(topic=topic, message=message, retain=False)
 
-  def __decode_telegram_element(self, register, element, jsonvalues):
+    return
+
+  # --------------------------------------------------------------------------------------------------------------------
+  # __decode_telegram_element
+  # --------------------------------------------------------------------------------------------------------------------
+  def __decode_telegram_element(self,
+                                register_description: Dict[str, Any],
+                                register_value: Any,
+                                values: Dict[str, Any]) -> Dict[str, Any]:
     """
-    :param register:
-    :param element:
-    :param jsonvalues:
-    :return:
+    Process single telegram element and add it to result dictionary.
+    :param register_description: MODBUS register description, including MODBUS_ADDRESS, MODBUS_DATAFORMAT, CHANNEL, ...
+    :param register_value: Value of the register, as read from the inverter.
+    :param values: json dictionary to store key:value pairs of all registers (constructing 1 by 1 for the MQTT message)
+    :return: same as (json) values param, updated with new key:value pairs for the current register_description, if any.
+
     :raises modbus exceptions
     """
 
-    MIN_SIGNED = (-2147483648 + 1)
-    MAX_UNSIGNED = (4294967295 - 1)
+    if register_value is None:
+      # None can happen during night (DC side is off)...Inverter returns NAN values, converted None values downstream
+      logger.debug(f"{self.__invertername}: register_value is None, ignored")
+      return values
 
-    mod_message = BinaryPayloadDecoder.fromRegisters(element.registers, byteorder=Endian.Big, wordorder=Endian.Big)
+    data_format = register_description['MODBUS_DATAFORMAT']
 
-    # provide the correct result depending on the defined datatype
-    datatype = register[sma_definition['DATATYPE']]
-    if datatype == 'S32': interpreted = mod_message.decode_32bit_int()
-    elif datatype == 'U32': interpreted = mod_message.decode_32bit_uint()
-    elif datatype == 'U64': interpreted = mod_message.decode_64bit_uint()
-    elif datatype == 'STR16': interpreted = mod_message.decode_string(16)
-    elif datatype == 'STR32': interpreted = mod_message.decode_string(32)
-    elif datatype == 'S16': interpreted = mod_message.decode_16bit_int()
-    elif datatype == 'U16': interpreted = mod_message.decode_16bit_uint()
-
-    # if no data type is defined do raw interpretation of the delivered data
-    else: interpreted = mod_message.decode_16bit_uint()
-
-    # check for "None" data before doing anything else
-    if (interpreted <= MIN_SIGNED) or (interpreted >= MAX_UNSIGNED):
+    if data_format in self.__dataformat.FORMAT_MULTIPLIERS:
+      json_value = float(register_value) * self.__dataformat.FORMAT_MULTIPLIERS[data_format]
+    elif data_format in self.__dataformat.STRING_FORMATS:
+      json_value = str(register_value)
+    elif data_format in self.__dataformat.PASSTHROUGH_FORMATS:
+      json_value = register_value
+    else:
+      # This will result in dropping specific key:value from mqtt message
+      logger.error(f"{self.__invertername}: Unknown format {data_format}")
       json_value = None
+
+    json_key = register_description['CHANNEL']
+    if json_value is not None:
+      values[json_key] = json_value
     else:
-      multiplier = register[sma_definition['FORMAT']]
-      # put the data with correct formatting into the data table
-      if multiplier == 'FIX3':   json_value = float(interpreted) / 1000.0
-      elif multiplier == 'FIX2': json_value = float(interpreted) / 100.0
-      elif multiplier == 'FIX1': json_value = float(interpreted) / 10.0
-      elif multiplier == 'STRING': json_value = str(interpreted)
-      else: json_value = interpreted
+      logger.debug(f"{self.__invertername}: key {json_key} has value None, ignored")
 
-    logger.debug(f"mod_message for {register[sma_definition['NAME']]} = {json_value}    {interpreted}")
+    return values
 
-    try:
-      json_key = register[sma_definition['JSONKEY']]
-    except IndexError:
-      json_key = register[sma_definition['NAME']]
+  # --------------------------------------------------------------------------------------------------------------------
+  # __decode_telegrams
+  # --------------------------------------------------------------------------------------------------------------------
+  def __decode_telegrams(self,
+                         telegram: List) -> None:
+    """Process complete telegram and publish via MQTT if valid."""
 
-    jsonvalues[json_key] = json_value
+    logger.debug(f"{self.__invertername}: >>")
 
-  def __decode_telegrams(self, telegram):
-    """
-    Args:
-      :param list telegram:
+    # dict of key:value, for MQTT JSON
+    json_values = {
+      "timestamp": int(time.time()),  # epoch, mqtt timestamp
+      "counter": telegram.pop(0)  # get counter and remove from telegram list
+    }
 
-    Returns:
+    logger.debug(f"TELEGRAM = {telegram}")
+    for (register, register_value) in telegram:
+      json_values = self.__decode_telegram_element(register_description=register,
+                                                   register_value=register_value,
+                                                   values=json_values)
 
-    """
-    logger.debug(f">>")
-    json_values = dict()
+    self.__publish_mqtt_message(json_values)
+    logger.debug(f"{self.__invertername}: <<")
+    return
 
-    # epoch, mqtt timestamp
-    ts = int(time.time())
-
-    # get counter and remove from telegram list
-    counter = telegram[0]
-    telegram.pop(0)
-
-    # Build a dict of key:value, for MQTT JSON
-    json_values["timestamp"] = ts
-    json_values["counter"] = counter
-
-    if cfg.INFLUXDB:
-      json_values["database"] = cfg.INFLUXDB
-
-    for (register, element) in telegram:
-      try:
-        self.__decode_telegram_element(register, element, json_values)
-      except Exception as e:
-        logger.warning(f"Exception {e}")
-        # ? break
-
-    # Parts of SMA inverter will go in standby at dusk/night
-    # Only serial and total_yield can be read
-    # Other register values are set to None
-    # Skip MQTT broadcast @ night
-    if None in json_values.values():
-      logger.debug(f"MQTT values = {json_values}...Not broadcasted...SMA Inverter is in night mode/standby mode")
-      pass
-    else:
-      logger.debug(f"MQTT values = {json_values}")
-      self.__publish_telegram(json_values)
-
-  def run(self):
-    logger.debug(">>")
+  # --------------------------------------------------------------------------------------------------------------------
+  # run
+  # --------------------------------------------------------------------------------------------------------------------
+  def run(self) -> None:
+    """Main thread loop for processing telegrams."""
+    logger.debug(f"{self.__invertername}: >>")
 
     while not self.__stopper.is_set():
       # block till event is set, but implement timeout to allow stopper
       self.__trigger.wait(timeout=1)
       if self.__trigger.is_set():
-        logger.debug(f"Trigger set")
+        logger.debug(f"{self.__invertername}: Trigger set")
 
         # Make copy of the telegram, for further parsing
         telegram = copy.deepcopy(self.__telegram)
@@ -176,6 +214,12 @@ class ParseTelegrams(threading.Thread):
         # Clear telegram list for next capture by ReadSerial class
         self.__telegram.clear()
 
-        self.__decode_telegrams(telegram)
+        # Catch unexpected exceptions & restart
+        try:
+          self.__decode_telegrams(telegram=telegram)
+        except Exception as e:
+          logger.error(f"{self.__invertername}: Unspecified exception: {e}; Restarting")
+          self.__stopper.set()
 
-    logger.debug("<<")
+    logger.debug(f"{self.__invertername}: <<")
+    return

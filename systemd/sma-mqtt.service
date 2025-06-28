@@ -19,7 +19,11 @@ Restart=on-failure
 RestartSec=60s
 
 Type=idle
-ExecStart=/opt/iot/sma/sma-mqtt.py
+WorkingDirectory=/opt/iot/sma/
+
+# A python venv environment has been used to install the libraries with PIP (when not available as Debian package)
+# Adapt for your venv path
+ExecStart=/opt/iot/venv/bin/python3 sma-mqtt.py
 #RemainAfterExit=true
 
 [Install]
